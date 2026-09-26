@@ -1,0 +1,42 @@
+// Simple textured-sprite effect with an additional "opacity" uniform so a
+// texture can be drawn with a variable, animatable strength on top of
+// whatever was already drawn to the target (used for the blink crossfade).
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float opacity;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSDrawOpacity(VertData v_in) : TARGET
+{
+	float4 rgba = image.Sample(textureSampler, v_in.uv);
+	rgba *= opacity;
+	return rgba;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDrawOpacity(v_in);
+	}
+};
