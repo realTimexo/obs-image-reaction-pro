@@ -17,58 +17,44 @@ if ( $env:CI -eq $null ) {
     throw "Build-Windows.ps1 requires CI environment"
 }
 
-if ( ! ( [System.Environment]::Is64BitOperatingSystem ) ) {
+if ( ! [System.Environment]::Is64BitOperatingSystem ) {
     throw "A 64-bit system is required to build the project."
 }
 
-if ( $PSVersionTable.PSVersion -lt '7.2.0' ) {
-    Write-Warning 'The obs-studio PowerShell build script requires PowerShell Core 7. Install or upgrade your PowerShell version: https://aka.ms/pscore6'
-    exit 2
+if ( $PSVersionTable.PSVersion -lt [version]'7.2.0' ) {
+    throw 'PowerShell Core 7.2 or newer is required.'
 }
 
 function Build {
     trap {
-        Pop-Location -Stack BuildTemp -ErrorAction 'SilentlyContinue'
+        Pop-Location -StackName BuildTemp -ErrorAction SilentlyContinue
         Write-Error $_
         Log-Group
         exit 2
     }
 
     $ScriptHome = $PSScriptRoot
-    $ProjectRoot = Resolve-Path -Path "$PSScriptRoot/../.."
+    $ProjectRoot = (Resolve-Path -Path "$PSScriptRoot/../..").Path
 
-    $UtilityFunctions = Get-ChildItem -Path $PSScriptRoot/utils.pwsh/*.ps1 -Recurse
-
-    foreach($Utility in $UtilityFunctions) {
-        Write-Debug "Loading $($Utility.FullName)"
+    $UtilityFunctions = Get-ChildItem -Path "$PSScriptRoot/utils.pwsh/*.ps1" -Recurse
+    foreach ( $Utility in $UtilityFunctions ) {
         . $Utility.FullName
     }
 
-    Push-Location -Stack BuildTemp
+    $BuildSpec = Get-Content -Path (Join-Path $ProjectRoot 'buildspec.json') -Raw | ConvertFrom-Json
+    $ProductName = $BuildSpec.name
+    Push-Location -StackName BuildTemp
     Ensure-Location $ProjectRoot
 
     $CmakeArgs = @('--preset', "windows-ci-${Target}")
-    $CmakeBuildArgs = @('--build')
-    $CmakeInstallArgs = @()
+    $CmakeBuildArgs = @('--build', '--preset', "windows-${Target}", '--config', $Configuration, '--parallel', '--', '/consoleLoggerParameters:Summary', '/noLogo')
+    $CmakeInstallArgs = @('--install', "build_${Target}", '--prefix', (Join-Path $ProjectRoot "release/$Configuration"), '--config', $Configuration)
 
     if ( $DebugPreference -eq 'Continue' ) {
-        $CmakeArgs += ('--debug-output')
-        $CmakeBuildArgs += ('--verbose')
-        $CmakeInstallArgs += ('--verbose')
+        $CmakeArgs += '--debug-output'
+        $CmakeBuildArgs += '--verbose'
+        $CmakeInstallArgs += '--verbose'
     }
-
-    $CmakeBuildArgs += @(
-        '--preset', "windows-${Target}"
-        '--config', $Configuration
-        '--parallel'
-        '--', '/consoleLoggerParameters:Summary', '/noLogo'
-    )
-
-    $CmakeInstallArgs += @(
-        '--install', "build_${Target}"
-        '--prefix', "${ProjectRoot}/release/${Configuration}"
-        '--config', $Configuration
-    )
 
     Log-Group "Configuring ${ProductName}..."
     Invoke-External cmake @CmakeArgs
@@ -79,7 +65,15 @@ function Build {
     Log-Group "Installing ${ProductName}..."
     Invoke-External cmake @CmakeInstallArgs
 
-    Pop-Location -Stack BuildTemp
+    $InstallRoot = Join-Path $ProjectRoot "release/$Configuration"
+    if ( ! ( Test-Path -LiteralPath $InstallRoot -PathType Container ) ) {
+        throw "The install directory was not created: $InstallRoot"
+    }
+    if ( ! ( Get-ChildItem -LiteralPath $InstallRoot -Recurse -File | Select-Object -First 1 ) ) {
+        throw "The install directory is empty: $InstallRoot"
+    }
+
+    Pop-Location -StackName BuildTemp
     Log-Group
 }
 

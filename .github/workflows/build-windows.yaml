@@ -1,0 +1,74 @@
+name: Build Windows
+
+on:
+  workflow_call:
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    name: Build Windows x64 ZIP
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Read plugin metadata
+        id: metadata
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $BuildSpec = Get-Content -Path buildspec.json -Raw | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace($BuildSpec.name) -or [string]::IsNullOrWhiteSpace($BuildSpec.version)) {
+            throw 'buildspec.json must define a non-empty name and version.'
+          }
+          "pluginName=$($BuildSpec.name)" >> $env:GITHUB_OUTPUT
+          "pluginVersion=$($BuildSpec.version)" >> $env:GITHUB_OUTPUT
+
+      - name: Build plugin
+        uses: ./.github/actions/build-plugin
+        with:
+          target: x64
+          config: RelWithDebInfo
+
+      - name: Package plugin as ZIP
+        uses: ./.github/actions/package-plugin
+        with:
+          target: x64
+          config: RelWithDebInfo
+          package: true
+
+      - name: Verify Windows ZIP
+        id: verify
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Expected = Join-Path $env:GITHUB_WORKSPACE "release/${{ steps.metadata.outputs.pluginName }}-${{ steps.metadata.outputs.pluginVersion }}-windows-x64.zip"
+          if (-not (Test-Path -LiteralPath $Expected -PathType Leaf)) {
+            Write-Host 'Files in release directory:'
+            Get-ChildItem -Path release -Recurse -File | Select-Object FullName, Length
+            throw "Expected Windows ZIP was not created: $Expected"
+          }
+          $Zip = Get-Item -LiteralPath $Expected
+          if ($Zip.Length -le 0) {
+            throw "Windows ZIP is empty: $($Zip.FullName)"
+          }
+          "zipPath=$($Zip.FullName)" >> $env:GITHUB_OUTPUT
+          "zipName=$($Zip.Name)" >> $env:GITHUB_OUTPUT
+          "zipSize=$($Zip.Length) bytes" >> $env:GITHUB_STEP_SUMMARY
+          "### Windows ZIP" >> $env:GITHUB_STEP_SUMMARY
+          "- `$($Zip.Name)` ($($Zip.Length) bytes)" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Windows ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.verify.outputs.zipName }}
+          path: ${{ steps.verify.outputs.zipPath }}
+          if-no-files-found: error
+          retention-days: 14

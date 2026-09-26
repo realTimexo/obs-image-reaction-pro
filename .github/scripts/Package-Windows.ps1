@@ -17,13 +17,12 @@ if ( $env:CI -eq $null ) {
     throw "Package-Windows.ps1 requires CI environment"
 }
 
-if ( ! ( [System.Environment]::Is64BitOperatingSystem ) ) {
-    throw "Packaging script requires a 64-bit system to build and run."
+if ( ! [System.Environment]::Is64BitOperatingSystem ) {
+    throw "Packaging requires a 64-bit system."
 }
 
-if ( $PSVersionTable.PSVersion -lt '7.2.0' ) {
-    Write-Warning 'The packaging script requires PowerShell Core 7. Install or upgrade your PowerShell version: https://aka.ms/pscore6'
-    exit 2
+if ( $PSVersionTable.PSVersion -lt [version]'7.2.0' ) {
+    throw 'PowerShell Core 7.2 or newer is required.'
 }
 
 function Package {
@@ -32,41 +31,40 @@ function Package {
         exit 2
     }
 
-    $ScriptHome = $PSScriptRoot
-    $ProjectRoot = Resolve-Path -Path "$PSScriptRoot/../.."
-    $BuildSpecFile = "${ProjectRoot}/buildspec.json"
-
-    $UtilityFunctions = Get-ChildItem -Path $PSScriptRoot/utils.pwsh/*.ps1 -Recurse
-
-    foreach( $Utility in $UtilityFunctions ) {
-        Write-Debug "Loading $($Utility.FullName)"
-        . $Utility.FullName
-    }
-
-    $BuildSpec = Get-Content -Path ${BuildSpecFile} -Raw | ConvertFrom-Json
+    $ProjectRoot = (Resolve-Path -Path "$PSScriptRoot/../..").Path
+    $BuildSpecFile = Join-Path $ProjectRoot 'buildspec.json'
+    $BuildSpec = Get-Content -Path $BuildSpecFile -Raw | ConvertFrom-Json
     $ProductName = $BuildSpec.name
     $ProductVersion = $BuildSpec.version
-
     $OutputName = "${ProductName}-${ProductVersion}-windows-${Target}"
+    $InstallRoot = Join-Path $ProjectRoot "release/$Configuration"
+    $OutputPath = Join-Path $ProjectRoot "release/${OutputName}.zip"
 
-    $RemoveArgs = @{
-        ErrorAction = 'SilentlyContinue'
-        Path = @(
-            "${ProjectRoot}/release/${ProductName}-*-windows-*.zip"
-        )
+    if ( ! ( Test-Path -LiteralPath $InstallRoot -PathType Container ) ) {
+        throw "The install directory does not exist: $InstallRoot"
     }
 
-    Remove-Item @RemoveArgs
-
-    Log-Group "Archiving ${ProductName}..."
-    $CompressArgs = @{
-        Path = (Get-ChildItem -Path "${ProjectRoot}/release/${Configuration}" -Exclude "${OutputName}*.*")
-        CompressionLevel = 'Optimal'
-        DestinationPath = "${ProjectRoot}/release/${OutputName}.zip"
-        Verbose = ($Env:CI -ne $null)
+    $Files = @(Get-ChildItem -LiteralPath $InstallRoot -Recurse -File)
+    if ( $Files.Count -eq 0 ) {
+        throw "The install directory is empty: $InstallRoot"
     }
-    Compress-Archive -Force @CompressArgs
-    Log-Group
+
+    Get-ChildItem -Path (Join-Path $ProjectRoot 'release') -Filter "$($ProductName)-*-windows-*.zip" -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+
+    Write-Host "Creating $OutputPath"
+    Push-Location $InstallRoot
+    try {
+        Compress-Archive -Path .\* -DestinationPath $OutputPath -CompressionLevel Optimal -Force
+    } finally {
+        Pop-Location
+    }
+
+    $Zip = Get-Item -LiteralPath $OutputPath
+    if ( $Zip.Length -le 0 ) {
+        throw "The generated ZIP is empty: $OutputPath"
+    }
+    Write-Host "Created $($Zip.Name) ($($Zip.Length) bytes)"
 }
 
 Package
