@@ -73,8 +73,36 @@ struct image_reaction_source {
 #define MAX(a,b) ((a)>(b) ? (a):(b))
 
 /* Custom effect used to draw the blink image on top of the base image with
- * an animatable opacity (see data/effects/image_opacity.effect). */
+ * an animatable opacity (see data/effects/image_opacity.effect). Loaded
+ * lazily on first render, since a graphics context is not guaranteed to be
+ * ready yet at obs_module_load() time on every platform/host. */
 static gs_effect_t *blink_opacity_effect = NULL;
+static bool blink_opacity_effect_load_attempted = false;
+
+static void image_reaction_ensure_blink_effect(void)
+{
+	if (blink_opacity_effect_load_attempted)
+		return;
+
+	blink_opacity_effect_load_attempted = true;
+
+	char *effect_path = obs_module_file("effects/image_opacity.effect");
+	if (!effect_path) {
+		obs_log(LOG_WARNING, "Could not resolve path for blink opacity effect; "
+				     "blinking will use a hard cut instead of a smooth fade");
+		return;
+	}
+
+	char *error_string = NULL;
+	blink_opacity_effect = gs_effect_create_from_file(effect_path, &error_string);
+	if (!blink_opacity_effect) {
+		obs_log(LOG_WARNING, "Failed to load blink opacity effect from '%s': %s; "
+				     "blinking will use a hard cut instead of a smooth fade",
+			effect_path, error_string ? error_string : "unknown error");
+	}
+	bfree(error_string);
+	bfree(effect_path);
+}
 
 static const char *image_reaction_source_get_name(void *unused)
 {
@@ -410,20 +438,37 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 	}
 
 	/* Draw the blink image on top, faded in/out by blink_alpha. */
-	if (context->blink_enabled && context->blink_alpha > 0.001f && blink_opacity_effect) {
+	if (context->blink_enabled && context->blink_alpha > 0.001f) {
 		gs_image_file4_t *blink_if = context->loud ? &context->if_blink_speaking : &context->if_blink_silent;
 
 		if (blink_if->image3.image2.image.texture) {
-			gs_eparam_t *const img_param = gs_effect_get_param_by_name(blink_opacity_effect, "image");
-			gs_eparam_t *const opacity_param = gs_effect_get_param_by_name(blink_opacity_effect, "opacity");
+			image_reaction_ensure_blink_effect();
 
-			gs_effect_set_texture_srgb(img_param, blink_if->image3.image2.image.texture);
-			gs_effect_set_float(opacity_param, context->blink_alpha);
+			if (blink_opacity_effect) {
+				/* Smooth crossfade using the dedicated opacity shader. */
+				gs_eparam_t *const img_param = gs_effect_get_param_by_name(blink_opacity_effect, "image");
+				gs_eparam_t *const opacity_param = gs_effect_get_param_by_name(blink_opacity_effect, "opacity");
 
-			while (gs_effect_loop(blink_opacity_effect, "Draw")) {
-				gs_draw_sprite(blink_if->image3.image2.image.texture, 0,
-					       blink_if->image3.image2.image.cx,
-					       blink_if->image3.image2.image.cy);
+				gs_effect_set_texture_srgb(img_param, blink_if->image3.image2.image.texture);
+				gs_effect_set_float(opacity_param, context->blink_alpha);
+
+				while (gs_effect_loop(blink_opacity_effect, "Draw")) {
+					gs_draw_sprite(blink_if->image3.image2.image.texture, 0,
+						       blink_if->image3.image2.image.cx,
+						       blink_if->image3.image2.image.cy);
+				}
+			} else {
+				/* Fallback if the custom effect could not be loaded for some
+				 * reason: still blink, just as a hard cut instead of a fade,
+				 * so the feature never silently does nothing. */
+				if (context->blink_alpha >= 0.5f) {
+					gs_eparam_t *const param = gs_effect_get_param_by_name(effect, "image");
+					gs_effect_set_texture_srgb(param, blink_if->image3.image2.image.texture);
+
+					gs_draw_sprite(blink_if->image3.image2.image.texture, 0,
+						       blink_if->image3.image2.image.cx,
+						       blink_if->image3.image2.image.cy);
+				}
 			}
 		}
 	}
@@ -737,32 +782,19 @@ extern struct obs_source_info slideshow_info;
 
 bool obs_module_load(void)
 {
-	obs_enter_graphics();
-	char *effect_path = obs_module_file("effects/image_opacity.effect");
-	if (effect_path) {
-		char *error_string = NULL;
-		blink_opacity_effect = gs_effect_create_from_file(effect_path, &error_string);
-		if (!blink_opacity_effect) {
-			obs_log(LOG_WARNING, "Failed to load blink opacity effect from '%s': %s",
-				effect_path, error_string ? error_string : "unknown error");
-		}
-		bfree(error_string);
-		bfree(effect_path);
-	} else {
-		obs_log(LOG_WARNING, "Could not resolve path for blink opacity effect");
-	}
-	obs_leave_graphics();
-
+	/* The blink opacity effect is loaded lazily on first render (see
+	 * image_reaction_ensure_blink_effect), since a graphics context is
+	 * not guaranteed to be ready yet at this point on every host. */
 	obs_register_source(&image_reaction_source_info);
 	return true;
 }
 
 void obs_module_unload(void)
 {
-	obs_enter_graphics();
 	if (blink_opacity_effect) {
+		obs_enter_graphics();
 		gs_effect_destroy(blink_opacity_effect);
 		blink_opacity_effect = NULL;
+		obs_leave_graphics();
 	}
-	obs_leave_graphics();
 }
