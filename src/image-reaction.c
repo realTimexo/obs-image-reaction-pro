@@ -10,6 +10,7 @@
 #include <util/platform.h>
 #include <util/dstr.h>
 #include <sys/stat.h>
+#include <stdlib.h>
 #include <media-io/audio-math.h>
 #include <plugin-support.h>
 
@@ -26,21 +27,42 @@ struct image_reaction_source {
 
 	gs_image_file4_t if41;
 	gs_image_file4_t if42;
-	
+
 	obs_weak_source_t *audio_source;
-	
+
 	bool loud;
 	float threshold;
 	float smoothness;
 	float average;
-	
+
 	uint64_t last_time;
 	uint64_t capture_check_time;
-	
+
 	bool animReset1;
 	bool animReset2;
 	bool loudOld;
 	bool animResetTrigger;
+
+	/* Blinking feature */
+	bool blink_enabled;
+	char *blink_silent_file;
+	char *blink_speaking_file;
+	bool blink_anim_reset;
+	float blink_interval;   /* average time between blinks, seconds */
+	float blink_variation;  /* random jitter around the interval, 0..0.95 */
+	float blink_duration;   /* how long a blink stays fully visible, seconds */
+	float blink_smoothness; /* crossfade time in/out of the blink, seconds */
+
+	gs_image_file4_t if_blink_silent;
+	gs_image_file4_t if_blink_speaking;
+
+	bool blink_rng_seeded;
+	bool blink_active;
+	float blink_wait_timer;
+	float blink_active_timer;
+	float blink_next_wait;
+	float blink_alpha;
+	bool blink_reset_trigger;
 };
 
 /*int MAX(int a, int b) {
@@ -50,22 +72,62 @@ struct image_reaction_source {
 #define MIN(a,b) ((a)<(b) ? (a):(b))
 #define MAX(a,b) ((a)>(b) ? (a):(b))
 
+/* Custom effect used to draw the blink image on top of the base image with
+ * an animatable opacity (see data/effects/image_opacity.effect). */
+static gs_effect_t *blink_opacity_effect = NULL;
+
 static const char *image_reaction_source_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
 	return obs_module_text("ImageReactionSource");
 }
 
+/* Picks a randomized wait time around blink_interval, jittered by
+ * +/- blink_variation (a fraction of the interval), so blinking doesn't
+ * look mechanical. */
+static float image_reaction_random_blink_wait(struct image_reaction_source *context)
+{
+	float base = MAX(context->blink_interval, 0.1f);
+
+	if (!context->blink_rng_seeded) {
+		srand((unsigned int)os_gettime_ns());
+		context->blink_rng_seeded = true;
+	}
+
+	if (context->blink_variation <= 0.0f)
+		return base;
+
+	float span = base * context->blink_variation;
+	float lo = MAX(0.1f, base - span);
+	float hi = base + span;
+	float r = (float)rand() / (float)RAND_MAX;
+
+	return lo + r * (hi - lo);
+}
+
 static void image_reaction_source_load(struct image_reaction_source *context)
 {
-	for (int i = 0; i <=1; i++) {
-		char *file = i == 0 ? context->file1 : context->file2;
-		gs_image_file4_t *if4 = i == 0 ? &context->if41 : &context->if42;
+	char *files[4] = {
+		context->file1,
+		context->file2,
+		context->blink_silent_file,
+		context->blink_speaking_file,
+	};
+	gs_image_file4_t *if4s[4] = {
+		&context->if41,
+		&context->if42,
+		&context->if_blink_silent,
+		&context->if_blink_speaking,
+	};
+
+	for (int i = 0; i <= 3; i++) {
+		char *file = files[i];
+		gs_image_file4_t *if4 = if4s[i];
 
 		obs_enter_graphics();
 		gs_image_file4_free(if4);
 		obs_leave_graphics();
-		
+
 		if (file && *file) {
 			obs_log(LOG_DEBUG, "loading texture '%s'", file);
 			gs_image_file4_init(if4, file,
@@ -88,6 +150,8 @@ static void image_reaction_source_unload(struct image_reaction_source *context)
 	obs_enter_graphics();
 	gs_image_file4_free(&context->if41);
 	gs_image_file4_free(&context->if42);
+	gs_image_file4_free(&context->if_blink_silent);
+	gs_image_file4_free(&context->if_blink_speaking);
 	obs_leave_graphics();
 }
 
@@ -132,6 +196,15 @@ static void image_reaction_source_update(void *data, obs_data_t *settings)
 	const float threshold = (float)obs_data_get_double(settings, "threshold");
 	const float smoothness = (float)obs_data_get_double(settings, "smoothness");
 
+	const bool blink_enabled = obs_data_get_bool(settings, "blink_enabled");
+	const char *blink_silent = obs_data_get_string(settings, "blink_silent");
+	const char *blink_speaking = obs_data_get_string(settings, "blink_speaking");
+	const bool blink_anim_reset = obs_data_get_bool(settings, "blink_anim_reset");
+	const float blink_interval = (float)obs_data_get_double(settings, "blink_interval");
+	const float blink_variation = (float)obs_data_get_double(settings, "blink_variation") / 100.0f;
+	const float blink_duration = (float)obs_data_get_double(settings, "blink_duration");
+	const float blink_smoothness = (float)obs_data_get_double(settings, "blink_smoothness");
+
 	if (context->file1)
 		bfree(context->file1);
 	context->file1 = bstrdup(file1);
@@ -147,6 +220,33 @@ static void image_reaction_source_update(void *data, obs_data_t *settings)
 	context->linear_alpha = linear_alpha;
 	context->threshold = db_to_mul(threshold);
 	context->smoothness = powf(0.1f, smoothness);
+
+	if (context->blink_silent_file)
+		bfree(context->blink_silent_file);
+	context->blink_silent_file = bstrdup(blink_silent);
+
+	if (context->blink_speaking_file)
+		bfree(context->blink_speaking_file);
+	context->blink_speaking_file = bstrdup(blink_speaking);
+
+	const bool blink_was_enabled = context->blink_enabled;
+
+	context->blink_enabled = blink_enabled;
+	context->blink_anim_reset = blink_anim_reset;
+	context->blink_interval = MAX(blink_interval, 0.1f);
+	context->blink_variation = MIN(MAX(blink_variation, 0.0f), 0.95f);
+	context->blink_duration = MAX(blink_duration, 0.01f);
+	context->blink_smoothness = MAX(blink_smoothness, 0.0f);
+
+	if (blink_enabled && !blink_was_enabled) {
+		/* Start from a clean, non-blinking state whenever the feature
+		 * gets (re-)enabled, so behavior is predictable. */
+		context->blink_active = false;
+		context->blink_wait_timer = 0.0f;
+		context->blink_active_timer = 0.0f;
+		context->blink_alpha = 0.0f;
+		context->blink_next_wait = image_reaction_random_blink_wait(context);
+	}
 
 	/* Load the image if the source is persistent or showing */
 	if (context->persistent || obs_source_showing(context->source))
@@ -194,6 +294,13 @@ static void image_reaction_source_defaults(obs_data_t *settings)
         obs_data_set_default_string(settings, "audio_source", "");
         obs_data_set_default_double(settings, "threshold", -40.0);
         obs_data_set_default_double(settings, "smoothness", 1.0);
+
+        obs_data_set_default_bool(settings, "blink_enabled", false);
+        obs_data_set_default_bool(settings, "blink_anim_reset", true);
+        obs_data_set_default_double(settings, "blink_interval", 10.0);
+        obs_data_set_default_double(settings, "blink_variation", 40.0);
+        obs_data_set_default_double(settings, "blink_duration", 0.18);
+        obs_data_set_default_double(settings, "blink_smoothness", 0.08);
 }
 
 static void image_reaction_source_show(void *data)
@@ -235,6 +342,12 @@ static void image_reaction_source_destroy(void *data)
 
 	if (context->file2)
 		bfree(context->file2);
+
+	if (context->blink_silent_file)
+		bfree(context->blink_silent_file);
+
+	if (context->blink_speaking_file)
+		bfree(context->blink_speaking_file);
 	
 	/*if (context->audio_source) {
 		//obs_source_t *source = obs_weak_source_get_source(context->audio_source);
@@ -261,13 +374,19 @@ static void image_reaction_source_destroy(void *data)
 static uint32_t image_reaction_source_getwidth(void *data)
 {
 	struct image_reaction_source *context = data;
-	return MAX(context->if41.image3.image2.image.cx, context->if42.image3.image2.image.cx);
+	uint32_t w = MAX(context->if41.image3.image2.image.cx, context->if42.image3.image2.image.cx);
+	w = MAX(w, context->if_blink_silent.image3.image2.image.cx);
+	w = MAX(w, context->if_blink_speaking.image3.image2.image.cx);
+	return w;
 }
 
 static uint32_t image_reaction_source_getheight(void *data)
 {
 	struct image_reaction_source *context = data;
-	return MAX(context->if41.image3.image2.image.cy, context->if42.image3.image2.image.cy);
+	uint32_t h = MAX(context->if41.image3.image2.image.cy, context->if42.image3.image2.image.cy);
+	h = MAX(h, context->if_blink_silent.image3.image2.image.cy);
+	h = MAX(h, context->if_blink_speaking.image3.image2.image.cy);
+	return h;
 }
 
 static void image_reaction_source_render(void *data, gs_effect_t *effect)
@@ -289,7 +408,25 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 			       if4->image3.image2.image.cx,
 			       if4->image3.image2.image.cy);
 	}
-	//context->loud = false;
+
+	/* Draw the blink image on top, faded in/out by blink_alpha. */
+	if (context->blink_enabled && context->blink_alpha > 0.001f && blink_opacity_effect) {
+		gs_image_file4_t *blink_if = context->loud ? &context->if_blink_speaking : &context->if_blink_silent;
+
+		if (blink_if->image3.image2.image.texture) {
+			gs_eparam_t *const img_param = gs_effect_get_param_by_name(blink_opacity_effect, "image");
+			gs_eparam_t *const opacity_param = gs_effect_get_param_by_name(blink_opacity_effect, "opacity");
+
+			gs_effect_set_texture_srgb(img_param, blink_if->image3.image2.image.texture);
+			gs_effect_set_float(opacity_param, context->blink_alpha);
+
+			while (gs_effect_loop(blink_opacity_effect, "Draw")) {
+				gs_draw_sprite(blink_if->image3.image2.image.texture, 0,
+					       blink_if->image3.image2.image.cx,
+					       blink_if->image3.image2.image.cy);
+			}
+		}
+	}
 
 	gs_blend_state_pop();
 
@@ -298,8 +435,6 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 
 static void image_reaction_tick(void *data, float seconds)
 {
-    (void)seconds;
-
 	struct image_reaction_source *context = data;
 	
 
@@ -330,27 +465,71 @@ static void image_reaction_tick(void *data, float seconds)
 			obs_source_release(capture);
 		}
 	}
+
+	// Advance the blink state machine (timing + smoothed crossfade alpha)
+	if (context->blink_enabled) {
+		if (!context->blink_active) {
+			context->blink_wait_timer += seconds;
+
+			if (context->blink_wait_timer >= context->blink_next_wait) {
+				context->blink_active = true;
+				context->blink_wait_timer = 0.0f;
+				context->blink_active_timer = 0.0f;
+				context->blink_reset_trigger = true;
+			}
+		} else {
+			context->blink_active_timer += seconds;
+
+			if (context->blink_active_timer >= context->blink_duration) {
+				context->blink_active = false;
+				context->blink_active_timer = 0.0f;
+				context->blink_next_wait = image_reaction_random_blink_wait(context);
+			}
+		}
+
+		const float target = context->blink_active ? 1.0f : 0.0f;
+
+		if (context->blink_smoothness <= 0.0001f) {
+			context->blink_alpha = target;
+		} else {
+			const float step = seconds / context->blink_smoothness;
+
+			if (context->blink_alpha < target)
+				context->blink_alpha = MIN(target, context->blink_alpha + step);
+			else if (context->blink_alpha > target)
+				context->blink_alpha = MAX(target, context->blink_alpha - step);
+		}
+	} else {
+		context->blink_active = false;
+		context->blink_wait_timer = 0.0f;
+		context->blink_active_timer = 0.0f;
+		context->blink_alpha = 0.0f;
+	}
 	
 	// update GIF's
 	uint64_t frame_time = obs_get_video_frame_time();
 	if (obs_source_active(context->source)) {
 		if (!context->active) {
-			if (context->if41.image3.image2.image.is_animated_gif || context->if42.image3.image2.image.is_animated_gif)
+			if (context->if41.image3.image2.image.is_animated_gif || context->if42.image3.image2.image.is_animated_gif ||
+			    context->if_blink_silent.image3.image2.image.is_animated_gif || context->if_blink_speaking.image3.image2.image.is_animated_gif)
 				context->last_time = frame_time;
 			context->active = true;
 		}
 
 	} else {
 		if (context->active) {
-			for (int i = 0; i <=1; i++) {
-				gs_image_file4_t *if4 = i == 0 ? &context->if41 : &context->if42;
-				if (if4->image3.image2.image.is_animated_gif) {
-					if4->image3.image2.image.cur_frame = 0;
-					if4->image3.image2.image.cur_loop = 0;
-					if4->image3.image2.image.cur_time = 0;
+			for (int i = 0; i <=3; i++) {
+				gs_image_file4_t *if4d = i == 0 ? &context->if41
+							: i == 1 ? &context->if42
+							: i == 2 ? &context->if_blink_silent
+								 : &context->if_blink_speaking;
+				if (if4d->image3.image2.image.is_animated_gif) {
+					if4d->image3.image2.image.cur_frame = 0;
+					if4d->image3.image2.image.cur_loop = 0;
+					if4d->image3.image2.image.cur_time = 0;
 
 					obs_enter_graphics();
-					gs_image_file4_update_texture(if4);
+					gs_image_file4_update_texture(if4d);
 					obs_leave_graphics();
 				}
 			}
@@ -359,34 +538,41 @@ static void image_reaction_tick(void *data, float seconds)
 		}
 	}
 
-	for (int i = 0; i <=1; i++) {
-		gs_image_file4_t *if4 = i == 0 ? &context->if41 : &context->if42;
-		bool animReset = i == 0 ? context->animReset1 : context->animReset2;
+	for (int i = 0; i <=3; i++) {
+		gs_image_file4_t *if4d = i == 0 ? &context->if41
+					: i == 1 ? &context->if42
+					: i == 2 ? &context->if_blink_silent
+						 : &context->if_blink_speaking;
+		bool animReset = i == 0 ? context->animReset1
+				: i == 1 ? context->animReset2
+					 : context->blink_anim_reset;
+		bool resetTrigger = i <= 1 ? context->animResetTrigger : context->blink_reset_trigger;
 		
 
-		if (context->last_time && if4->image3.image2.image.is_animated_gif) {
-			if (animReset && context->animResetTrigger) {
-				if4->image3.image2.image.cur_frame = 0;
-				if4->image3.image2.image.cur_loop = 0;
-				if4->image3.image2.image.cur_time = 0;
+		if (context->last_time && if4d->image3.image2.image.is_animated_gif) {
+			if (animReset && resetTrigger) {
+				if4d->image3.image2.image.cur_frame = 0;
+				if4d->image3.image2.image.cur_loop = 0;
+				if4d->image3.image2.image.cur_time = 0;
 
 				obs_enter_graphics();
-				gs_image_file4_update_texture(if4);
+				gs_image_file4_update_texture(if4d);
 				obs_leave_graphics();
 			}
 			else {
 				uint64_t elapsed = frame_time - context->last_time;
-				bool updated = gs_image_file4_tick(if4, elapsed);
+				bool updated = gs_image_file4_tick(if4d, elapsed);
 
 				if (updated) {
 					obs_enter_graphics();
-					gs_image_file4_update_texture(if4);
+					gs_image_file4_update_texture(if4d);
 					obs_leave_graphics();
 				}
 			}
 		}
 	}
 	context->animResetTrigger = false;
+	context->blink_reset_trigger = false;
 
 	context->last_time = frame_time;
 }
@@ -448,7 +634,6 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 				OBS_PATH_FILE, image_filter, path.array);
 	obs_properties_add_bool(props, "anim_reset_2",
 				obs_module_text("AnimReset2"));
-	dstr_free(&path);
 	
 	obs_properties_add_bool(props, "unload",
 				obs_module_text("UnloadWhenNotShowing"));
@@ -464,6 +649,37 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 	
 	obs_properties_add_float_slider(props, "smoothness",
 		obs_module_text("Smoothness"), 0.0, 5.0, 0.1);
+
+	/* --- Blinking (optional) --- */
+	obs_properties_t *blink_group = obs_properties_create();
+
+	obs_properties_add_path(blink_group, "blink_silent", obs_module_text("BlinkSilent"),
+				OBS_PATH_FILE, image_filter, path.array);
+	obs_properties_add_path(blink_group, "blink_speaking", obs_module_text("BlinkSpeaking"),
+				OBS_PATH_FILE, image_filter, path.array);
+	obs_properties_add_bool(blink_group, "blink_anim_reset",
+				obs_module_text("BlinkAnimReset"));
+
+	obs_property_t *interval_p = obs_properties_add_float_slider(blink_group, "blink_interval",
+		obs_module_text("BlinkInterval"), 1.0, 60.0, 0.5);
+	obs_property_float_set_suffix(interval_p, " s");
+
+	obs_property_t *variation_p = obs_properties_add_float_slider(blink_group, "blink_variation",
+		obs_module_text("BlinkVariation"), 0.0, 90.0, 1.0);
+	obs_property_float_set_suffix(variation_p, " %");
+
+	obs_property_t *duration_p = obs_properties_add_float_slider(blink_group, "blink_duration",
+		obs_module_text("BlinkDuration"), 0.05, 1.0, 0.01);
+	obs_property_float_set_suffix(duration_p, " s");
+
+	obs_property_t *smooth_p = obs_properties_add_float_slider(blink_group, "blink_smoothness",
+		obs_module_text("BlinkSmoothness"), 0.0, 1.0, 0.01);
+	obs_property_float_set_suffix(smooth_p, " s");
+
+	obs_properties_add_group(props, "blink_enabled", obs_module_text("BlinkEnabled"),
+				OBS_GROUP_CHECKABLE, blink_group);
+
+	dstr_free(&path);
 	
 	//obs_property_set_modified_callback(src, source_changed);
 	obs_enum_sources(add_source, sources_list);
@@ -474,7 +690,8 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 uint64_t image_reaction_source_get_memory_usage(void *data)
 {
 	struct image_reaction_source *s = data;
-	return s->if41.image3.image2.mem_usage + s->if42.image3.image2.mem_usage;
+	return s->if41.image3.image2.mem_usage + s->if42.image3.image2.mem_usage +
+	       s->if_blink_silent.image3.image2.mem_usage + s->if_blink_speaking.image3.image2.mem_usage;
 }
 
 static void missing_file_callback(void *src, const char *new_path, void *data)
@@ -520,7 +737,32 @@ extern struct obs_source_info slideshow_info;
 
 bool obs_module_load(void)
 {
+	obs_enter_graphics();
+	char *effect_path = obs_module_file("effects/image_opacity.effect");
+	if (effect_path) {
+		char *error_string = NULL;
+		blink_opacity_effect = gs_effect_create_from_file(effect_path, &error_string);
+		if (!blink_opacity_effect) {
+			obs_log(LOG_WARNING, "Failed to load blink opacity effect from '%s': %s",
+				effect_path, error_string ? error_string : "unknown error");
+		}
+		bfree(error_string);
+		bfree(effect_path);
+	} else {
+		obs_log(LOG_WARNING, "Could not resolve path for blink opacity effect");
+	}
+	obs_leave_graphics();
+
 	obs_register_source(&image_reaction_source_info);
 	return true;
 }
 
+void obs_module_unload(void)
+{
+	obs_enter_graphics();
+	if (blink_opacity_effect) {
+		gs_effect_destroy(blink_opacity_effect);
+		blink_opacity_effect = NULL;
+	}
+	obs_leave_graphics();
+}
