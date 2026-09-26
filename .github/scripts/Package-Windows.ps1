@@ -38,22 +38,46 @@ function Package {
     $ProductVersion = $BuildSpec.version
     $OutputName = "${ProductName}-${ProductVersion}-windows-${Target}"
     $InstallRoot = Join-Path $ProjectRoot "release/$Configuration"
-    $OutputPath = Join-Path $ProjectRoot "release/${OutputName}.zip"
+    $InstalledPluginRoot = Join-Path $InstallRoot $ProductName
+    $InstalledBinRoot = Join-Path $InstalledPluginRoot 'bin'
+    $InstalledDataRoot = Join-Path $InstalledPluginRoot 'data'
+    $ReleaseRoot = Join-Path $ProjectRoot 'release'
+    $StageRoot = Join-Path $ReleaseRoot ".staging/$OutputName"
+    $OutputPath = Join-Path $ReleaseRoot "${OutputName}.zip"
 
-    if ( ! ( Test-Path -LiteralPath $InstallRoot -PathType Container ) ) {
-        throw "The install directory does not exist: $InstallRoot"
+    if ( ! ( Test-Path -LiteralPath $InstalledBinRoot -PathType Container ) ) {
+        throw "The installed plugin bin directory does not exist: $InstalledBinRoot"
+    }
+    if ( ! ( Test-Path -LiteralPath $InstalledDataRoot -PathType Container ) ) {
+        throw "The installed plugin data directory does not exist: $InstalledDataRoot"
     }
 
-    $Files = @(Get-ChildItem -LiteralPath $InstallRoot -Recurse -File)
-    if ( $Files.Count -eq 0 ) {
-        throw "The install directory is empty: $InstallRoot"
+    $InstalledFiles = @(Get-ChildItem -LiteralPath $InstalledPluginRoot -Recurse -File)
+    if ( $InstalledFiles.Count -eq 0 ) {
+        throw "The installed plugin directory is empty: $InstalledPluginRoot"
     }
 
-    Get-ChildItem -Path (Join-Path $ProjectRoot 'release') -Filter "$($ProductName)-*-windows-*.zip" -File -ErrorAction SilentlyContinue |
+    Get-ChildItem -Path $ReleaseRoot -Filter "$($ProductName)-*-windows-*.zip" -File -ErrorAction SilentlyContinue |
         Remove-Item -Force
+    Remove-Item -LiteralPath $StageRoot -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Path $StageRoot -Force | Out-Null
+
+    # OBS expects these two directories at the root of the plugin ZIP:
+    #   obs-plugins/64bit/<plugin>.dll
+    #   data/<plugin>/...
+    $PackageBinRoot = Join-Path $StageRoot 'obs-plugins'
+    $PackageDataRoot = Join-Path $StageRoot 'data'
+    New-Item -ItemType Directory -Path $PackageBinRoot, $PackageDataRoot -Force | Out-Null
+    Copy-Item -Path (Join-Path $InstalledBinRoot '*') -Destination $PackageBinRoot -Recurse
+    Copy-Item -Path (Join-Path $InstalledDataRoot '*') -Destination $PackageDataRoot -Recurse
+
+    $PackageFiles = @(Get-ChildItem -LiteralPath $StageRoot -Recurse -File)
+    if ( $PackageFiles.Count -eq 0 ) {
+        throw "The package staging directory is empty: $StageRoot"
+    }
 
     Write-Host "Creating $OutputPath"
-    Push-Location $InstallRoot
+    Push-Location $StageRoot
     try {
         Compress-Archive -Path .\* -DestinationPath $OutputPath -CompressionLevel Optimal -Force
     } finally {

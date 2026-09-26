@@ -59,6 +59,21 @@ jobs:
           if ($Zip.Length -le 0) {
             throw "Windows ZIP is empty: $($Zip.FullName)"
           }
+          $ExtractRoot = Join-Path $env:RUNNER_TEMP 'image-reaction-zip-check'
+          Remove-Item -LiteralPath $ExtractRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $Zip.FullName -DestinationPath $ExtractRoot -Force
+          $RootEntries = @(Get-ChildItem -LiteralPath $ExtractRoot -Force)
+          $RootNames = @($RootEntries.Name)
+          if ($RootNames -notcontains 'data' -or $RootNames -notcontains 'obs-plugins') {
+            throw "ZIP must contain data and obs-plugins at its root. Found: $($RootNames -join ', ')"
+          }
+          if ($RootEntries.Count -ne 2) {
+            throw "ZIP must contain exactly data and obs-plugins at its root. Found: $($RootNames -join ', ')"
+          }
+          $Dll = Get-ChildItem -LiteralPath (Join-Path $ExtractRoot 'obs-plugins/64bit') -Filter '*.dll' -File | Select-Object -First 1
+          if ($null -eq $Dll) {
+            throw 'ZIP does not contain a DLL under obs-plugins/64bit.'
+          }
           "zipPath=$($Zip.FullName)" >> $env:GITHUB_OUTPUT
           "zipName=$($Zip.Name)" >> $env:GITHUB_OUTPUT
           "zipSize=$($Zip.Length) bytes" >> $env:GITHUB_STEP_SUMMARY
