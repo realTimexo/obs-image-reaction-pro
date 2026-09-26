@@ -84,6 +84,9 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Fix Action Permissions 🛠️
+        run: chmod -R +x .github/actions/
+
       - name: Set Up Environment 🔧
         id: setup
         run: |
@@ -190,6 +193,9 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - name: Fix Action Permissions 🛠️
+        run: chmod -R +x .github/actions/
 
       - name: Set Up Environment 🔧
         id: setup
